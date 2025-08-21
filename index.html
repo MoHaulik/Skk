@@ -1,0 +1,491 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>WebXR AR Shadow Game</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script type="importmap">{"imports": {"three": "https://unpkg.com/three@0.150.1/build/three.module.js"}}</script>
+  <style>
+    body { margin: 0; overflow: hidden; font-family: Arial, sans-serif; }
+    #ui { position: absolute; top: 20px; left: 20px; z-index: 1000; }
+    #startBtn { padding: 15px 30px; font-size: 18px; background: #ff6b35; color: white; border: none; border-radius: 25px; cursor: pointer; }
+    #status { margin-top: 10px; padding: 10px; background: rgba(0,0,0,0.8); color: white; border-radius: 5px; max-width: 300px; display: none; }
+    .xr-active #ui { display: none; }
+  </style>
+</head>
+<body>
+  <div id="ui">
+    <button id="startBtn">Start Shadow Game</button>
+    <div id="status"></div>
+  </div>
+
+  <script type="module">
+    import * as THREE from 'three';
+
+    let scene, camera, renderer, xrSession;
+    let candle, character, wall, shadow;
+    let controllers = [], grabbedCandle = false;
+    let obstacles = [], enemies = [];
+    let gameActive = false;
+
+    // Game constants
+    const CANDLE_MIN_DIST = 0.3;
+    const CANDLE_MAX_DIST = 1.5;
+    const WALL_DISTANCE = 2.0;
+    const SHADOW_MIN_SIZE = 0.3;
+    const SHADOW_MAX_SIZE = 1.2;
+
+    function updateStatus(msg) {
+      const status = document.getElementById('status');
+      status.textContent = msg;
+      status.style.display = 'block';
+      setTimeout(() => status.style.display = 'none', 3000);
+    }
+
+    function init() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 20);
+      
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      renderer.xr.enabled = true;
+      renderer.setClearColor(0x000000, 0);
+      document.body.appendChild(renderer.domElement);
+
+      // Minimal ambient light for AR
+      scene.add(new THREE.AmbientLight(0x404040, 0.2));
+
+      document.getElementById('startBtn').onclick = startAR;
+      window.addEventListener('resize', onResize);
+    }
+
+    function createCandle() {
+      const group = new THREE.Group();
+      
+      // Candle body
+      const bodyGeo = new THREE.CylinderGeometry(0.015, 0.02, 0.12, 8);
+      const bodyMat = new THREE.MeshStandardMaterial({ color: 0xf5f5dc });
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      body.position.y = 0.06;
+      group.add(body);
+      
+      // Flame
+      const flameGeo = new THREE.SphereGeometry(0.01, 6, 6);
+      const flameMat = new THREE.MeshStandardMaterial({ 
+        color: 0xff6600, 
+        emissive: 0xff3300, 
+        emissiveIntensity: 0.8 
+      });
+      const flame = new THREE.Mesh(flameGeo, flameMat);
+      flame.position.y = 0.13;
+      flame.scale.set(1, 1.5, 1);
+      group.add(flame);
+      
+      // Light
+      const light = new THREE.PointLight(0xff6600, 1.5, 3);
+      light.position.y = 0.13;
+      group.add(light);
+      
+      group.position.set(0.2, 0, -0.4);
+      group.userData = { type: 'candle' };
+      return group;
+    }
+
+    function createCharacter() {
+      const group = new THREE.Group();
+      const mat = new THREE.MeshStandardMaterial({ color: 0x333333 });
+      
+      // Body
+      const bodyGeo = new THREE.CylinderGeometry(0.004, 0.004, 0.2, 6);
+      const body = new THREE.Mesh(bodyGeo, mat);
+      body.position.y = 0.1;
+      group.add(body);
+      
+      // Head
+      const headGeo = new THREE.SphereGeometry(0.03, 8, 8);
+      const head = new THREE.Mesh(headGeo, mat);
+      head.position.y = 0.23;
+      group.add(head);
+      
+      // Arms
+      const armGeo = new THREE.CylinderGeometry(0.002, 0.002, 0.12, 4);
+      [-0.06, 0.06].forEach((x, i) => {
+        const arm = new THREE.Mesh(armGeo, mat);
+        arm.position.set(x, 0.18, 0);
+        arm.rotation.z = i === 0 ? 0.3 : -0.3;
+        group.add(arm);
+      });
+      
+      // Legs
+      const legGeo = new THREE.CylinderGeometry(0.002, 0.002, 0.12, 4);
+      [-0.03, 0.03].forEach(x => {
+        const leg = new THREE.Mesh(legGeo, mat);
+        leg.position.set(x, -0.06, 0);
+        group.add(leg);
+      });
+      
+      group.position.set(0, -0.3, -1.0);
+      return group;
+    }
+
+    function createWall() {
+      const group = new THREE.Group();
+      
+      // Wall surface
+      const wallGeo = new THREE.PlaneGeometry(2.5, 1.8);
+      const wallMat = new THREE.MeshLambertMaterial({ 
+        color: 0xf0f0f0, 
+        transparent: true, 
+        opacity: 0.9 
+      });
+      const wallMesh = new THREE.Mesh(wallGeo, wallMat);
+      group.add(wallMesh);
+      
+      // Frame
+      const frameGeo = new THREE.RingGeometry(1.22, 1.27, 4);
+      const frameMat = new THREE.MeshStandardMaterial({ color: 0x8b4513 });
+      const frame = new THREE.Mesh(frameGeo, frameMat);
+      frame.scale.set(2, 1.4, 1);
+      group.add(frame);
+      
+      group.position.set(0, 0, -WALL_DISTANCE);
+      return group;
+    }
+
+    function createShadow() {
+      const shadowGeo = new THREE.PlaneGeometry(1, 1);
+      const shadowMat = new THREE.MeshBasicMaterial({ 
+        color: 0x000000, 
+        transparent: true, 
+        opacity: 0.8 
+      });
+      const shadowMesh = new THREE.Mesh(shadowGeo, shadowMat);
+      shadowMesh.position.z = -WALL_DISTANCE + 0.001;
+      return shadowMesh;
+    }
+
+    function createObstacle(x, y, width, height, isGap = false) {
+      const group = new THREE.Group();
+      
+      if (isGap) {
+        // Create frame around gap
+        const frameThick = 0.03;
+        const frameMat = new THREE.MeshBasicMaterial({ color: 0x654321 });
+        
+        // Top/bottom bars
+        [height/2 + frameThick/2, -height/2 - frameThick/2].forEach(yPos => {
+          const bar = new THREE.Mesh(new THREE.PlaneGeometry(width + frameThick*2, frameThick), frameMat);
+          bar.position.y = yPos;
+          group.add(bar);
+        });
+        
+        // Side bars
+        [width/2 + frameThick/2, -width/2 - frameThick/2].forEach(xPos => {
+          const bar = new THREE.Mesh(new THREE.PlaneGeometry(frameThick, height), frameMat);
+          bar.position.x = xPos;
+          group.add(bar);
+        });
+      } else {
+        // Solid obstacle
+        const obstacleGeo = new THREE.PlaneGeometry(width, height);
+        const obstacleMat = new THREE.MeshBasicMaterial({ color: 0x8b4513, opacity: 0.9, transparent: true });
+        const obstacle = new THREE.Mesh(obstacleGeo, obstacleMat);
+        group.add(obstacle);
+      }
+      
+      group.position.set(x, y, 0.002);
+      group.userData = { type: 'obstacle', isGap, width, height };
+      return group;
+    }
+
+    function createEnemy(x, y, size = 0.1) {
+      const group = new THREE.Group();
+      
+      // Enemy body
+      const bodyGeo = new THREE.SphereGeometry(size/2, 8, 8);
+      const bodyMat = new THREE.MeshBasicMaterial({ color: 0x4a0e4e, transparent: true, opacity: 0.8 });
+      const body = new THREE.Mesh(bodyGeo, bodyMat);
+      group.add(body);
+      
+      // Enemy legs (spider-like)
+      for (let i = 0; i < 6; i++) {
+        const angle = (i / 6) * Math.PI * 2;
+        const legGeo = new THREE.CylinderGeometry(0.001, 0.001, size*0.8, 3);
+        const legMat = new THREE.MeshBasicMaterial({ color: 0x2d0833 });
+        const leg = new THREE.Mesh(legGeo, legMat);
+        leg.position.set(Math.cos(angle) * size/3, Math.sin(angle) * size/3, 0);
+        leg.rotation.z = angle;
+        group.add(leg);
+      }
+      
+      group.position.set(x, y, 0.003);
+      group.userData = { 
+        type: 'enemy', 
+        size, 
+        originalPos: {x, y}, 
+        isScared: false,
+        scareRadius: size * 3
+      };
+      return group;
+    }
+
+    function calculateShadowSize() {
+      if (!candle || !character) return SHADOW_MIN_SIZE;
+      
+      const candlePos = new THREE.Vector3();
+      const charPos = new THREE.Vector3();
+      candle.getWorldPosition(candlePos);
+      character.getWorldPosition(charPos);
+      
+      const dist = candlePos.distanceTo(charPos);
+      const clampedDist = Math.max(CANDLE_MIN_DIST, Math.min(CANDLE_MAX_DIST, dist));
+      
+      // Inverse: closer candle = bigger shadow
+      const ratio = (CANDLE_MAX_DIST - clampedDist) / (CANDLE_MAX_DIST - CANDLE_MIN_DIST);
+      return SHADOW_MIN_SIZE + ratio * (SHADOW_MAX_SIZE - SHADOW_MIN_SIZE);
+    }
+
+    function updateShadow() {
+      if (!shadow || !character) return;
+      
+      const size = calculateShadowSize();
+      shadow.scale.setScalar(size);
+      
+      // Project character position onto wall
+      const charWorldPos = new THREE.Vector3();
+      character.getWorldPosition(charWorldPos);
+      shadow.position.x = charWorldPos.x;
+      shadow.position.y = charWorldPos.y;
+    }
+
+    function checkCollisions() {
+      if (!shadow) return;
+      
+      const shadowSize = calculateShadowSize();
+      const shadowPos = shadow.position;
+      
+      // Check obstacles
+      obstacles.forEach(obstacle => {
+        const obsPos = obstacle.position;
+        const {width, height, isGap} = obstacle.userData;
+        
+        const dx = Math.abs(shadowPos.x - obsPos.x);
+        const dy = Math.abs(shadowPos.y - obsPos.y);
+        
+        if (dx < width/2 + shadowSize/2 && dy < height/2 + shadowSize/2) {
+          if (isGap) {
+            // Check if shadow fits through gap
+            if (shadowSize > Math.min(width, height) * 0.9) {
+              console.log('Shadow too big for gap!');
+            }
+          } else {
+            console.log('Hit obstacle!');
+          }
+        }
+      });
+      
+      // Check enemies
+      enemies.forEach(enemy => {
+        const enemyPos = enemy.position;
+        const dist = shadowPos.distanceTo(enemyPos);
+        const {size, scareRadius} = enemy.userData;
+        
+        if (shadowSize > size * 2.5) {
+          // Big shadow scares enemy
+          if (dist < scareRadius && !enemy.userData.isScared) {
+            enemy.userData.isScared = true;
+            const direction = new THREE.Vector3().subVectors(enemyPos, shadowPos).normalize();
+            enemy.position.add(direction.multiplyScalar(0.3));
+            enemy.children[0].material.color.setHex(0x808080);
+          }
+        } else {
+          // Small shadow doesn't scare
+          if (enemy.userData.isScared) {
+            enemy.userData.isScared = false;
+            enemy.children[0].material.color.setHex(0x4a0e4e);
+          }
+        }
+      });
+    }
+
+    function spawnGameElements() {
+      // Add obstacles to wall
+      obstacles.push(wall.add(createObstacle(-0.6, 0.2, 0.25, 0.3, false)));
+      obstacles.push(wall.add(createObstacle(0.4, -0.1, 0.3, 0.2, false)));
+      obstacles.push(wall.add(createObstacle(0, 0.4, 0.4, 0.15, true)));
+      obstacles.push(wall.add(createObstacle(-0.2, -0.4, 0.25, 0.2, true)));
+      
+      // Add enemies to wall
+      enemies.push(wall.add(createEnemy(-0.4, 0.5, 0.08)));
+      enemies.push(wall.add(createEnemy(0.6, 0.1, 0.1)));
+      enemies.push(wall.add(createEnemy(-0.1, -0.6, 0.07)));
+    }
+
+    function setupControllers() {
+      for (let i = 0; i < 2; i++) {
+        const controller = renderer.xr.getController(i);
+        controller.userData.id = i;
+        
+        // Hand visual
+        const handGeo = new THREE.SphereGeometry(0.01, 8, 8);
+        const handMat = new THREE.MeshStandardMaterial({ 
+          color: i === 0 ? 0xff6600 : 0x0066ff,
+          emissive: i === 0 ? 0xff3300 : 0x003399,
+          emissiveIntensity: 0.3
+        });
+        controller.add(new THREE.Mesh(handGeo, handMat));
+        
+        controller.addEventListener('selectstart', onSelectStart);
+        controller.addEventListener('selectend', onSelectEnd);
+        
+        scene.add(controller);
+        controllers.push(controller);
+      }
+    }
+
+    function onSelectStart(event) {
+      const controller = event.target;
+      const controllerPos = new THREE.Vector3();
+      controller.getWorldPosition(controllerPos);
+      
+      if (candle) {
+        const candlePos = new THREE.Vector3();
+        candle.getWorldPosition(candlePos);
+        
+        if (controllerPos.distanceTo(candlePos) < 0.15) {
+          grabbedCandle = controller;
+          candle.children[1].material.emissiveIntensity = 1.2;
+        }
+      }
+    }
+
+    function onSelectEnd(event) {
+      if (grabbedCandle === event.target) {
+        grabbedCandle = false;
+        if (candle) candle.children[1].material.emissiveIntensity = 0.8;
+      }
+    }
+
+    function updateCandleMovement() {
+      if (!grabbedCandle || !candle || !character) return;
+      
+      const controllerPos = new THREE.Vector3();
+      grabbedCandle.getWorldPosition(controllerPos);
+      
+      // Move candle to controller
+      candle.position.copy(controllerPos);
+      
+      // Constrain distance from character
+      const charPos = new THREE.Vector3();
+      character.getWorldPosition(charPos);
+      const dist = candle.position.distanceTo(charPos);
+      
+      if (dist < CANDLE_MIN_DIST) {
+        const dir = new THREE.Vector3().subVectors(candle.position, charPos).normalize();
+        candle.position.copy(charPos).add(dir.multiplyScalar(CANDLE_MIN_DIST));
+      } else if (dist > CANDLE_MAX_DIST) {
+        const dir = new THREE.Vector3().subVectors(candle.position, charPos).normalize();
+        candle.position.copy(charPos).add(dir.multiplyScalar(CANDLE_MAX_DIST));
+      }
+    }
+
+    function animate() {
+      if (!gameActive) return;
+      
+      updateCandleMovement();
+      updateShadow();
+      checkCollisions();
+      
+      // Keep wall facing camera
+      if (wall && camera) {
+        wall.lookAt(camera.position);
+      }
+      
+      // Animate flame
+      if (candle?.children[1]) {
+        const time = Date.now() * 0.005;
+        candle.children[1].scale.y = 1.5 + Math.sin(time * 8) * 0.15;
+        candle.children[1].rotation.z = Math.sin(time * 4) * 0.08;
+      }
+      
+      // Animate enemies
+      enemies.forEach((enemy, i) => {
+        if (!enemy.userData.isScared) {
+          const time = Date.now() * 0.003;
+          enemy.rotation.z += 0.01;
+          enemy.position.y += Math.sin(time * 2 + i) * 0.001;
+        }
+      });
+    }
+
+    async function startAR() {
+      if (!navigator.xr) {
+        updateStatus('WebXR not supported');
+        return;
+      }
+
+      try {
+        const supported = await navigator.xr.isSessionSupported('immersive-ar');
+        if (!supported) {
+          updateStatus('AR not supported');
+          return;
+        }
+
+        const session = await navigator.xr.requestSession('immersive-ar', {
+          requiredFeatures: ['hit-test'],
+          optionalFeatures: ['dom-overlay'],
+          domOverlay: { root: document.body }
+        });
+
+        xrSession = session;
+        renderer.xr.setSession(session);
+        document.body.classList.add('xr-active');
+
+        setupControllers();
+
+        // Create game objects
+        candle = createCandle();
+        character = createCharacter();
+        wall = createWall();
+        shadow = createShadow();
+
+        scene.add(candle, character, wall, shadow);
+        spawnGameElements();
+
+        gameActive = true;
+        updateStatus('Move the candle to control your shadow size!');
+
+        renderer.setAnimationLoop(() => {
+          animate();
+          renderer.render(scene, camera);
+        });
+
+        session.addEventListener('end', () => {
+          document.body.classList.remove('xr-active');
+          gameActive = false;
+          renderer.setAnimationLoop(null);
+          
+          // Clean up
+          [candle, character, wall, shadow].forEach(obj => {
+            if (obj) scene.remove(obj);
+          });
+          obstacles.length = 0;
+          enemies.length = 0;
+          controllers.length = 0;
+        });
+
+      } catch (error) {
+        updateStatus('Failed to start AR: ' + error.message);
+      }
+    }
+
+    function onResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    }
+
+    init();
+  </script>
+</body>
+</html>
